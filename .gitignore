@@ -169,3 +169,29 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# Notebooks
+causal.ipynb
+english-analysis.ipynb 
+spade_evals.ipynb
+
+# Experiment notes
+notes.md
+
+# Pycache
+*/__pycache__/
+
+# Models
+# results/
+# sae_results/
+
+# Weights and biases
+wandb/
+logs/
+
+# DS_Store
+.DS_Store
+config/.DS_Store
+sae_results/
+results/

@@ -1,0 +1,58 @@
+deploy: True
+tag: scratch
+seed: 42
+
+device : "cuda:0"
+bf16: True
+epochs: 1
+
+pt_model_dir: './results/scratch/5fr59ylf'
+
+data:
+  batch_size: 128
+  num_workers: 2
+
+sae:
+  sae_type: 'jumprelu' # ['relu', 'jumprelu', 'topk', 'sparsemax_dist']
+  exp_factor: 2
+  kval_topk: 2
+  gamma_reg: 0.001 # ['default' <-- stick with this in general]
+  encoder_reg: True
+
+optimizer:
+  learning_rate: 1e-3
+  weight_decay: 1e-4
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  decay_lr: True
+  warmup_iters: 200
+  min_lr: 9e-4
+
+eval:
+  save_tables: False
+
+log: 
+  save_multiple: False
+  log_interval: 10
+  eval_interval: 1000
+  save_interval: 100
+
+
+# Nested configs. Disable hydra logging
+defaults:
+  - _self_
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+# Disable hydra directory structure
+hydra:
+  output_subdir: Null
+  job:
+    chdir: False
+  run:
+    dir: .
+
+  sweep:
+    dir: .
+    subdir: .
