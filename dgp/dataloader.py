@@ -1,10 +1,46 @@
 import torch
 from typing import Tuple
+from collections import defaultdict
 from torch.utils.data import DataLoader
 import numpy as np
+import json
 import os
 from .PCFG import PCFG
+from transformers import AutoTokenizer
 import pickle as pkl
+
+def get_dataloader_json(
+        path: str=None,
+        corr_config: str=None,
+        num_iters: int=1e6,
+        max_sample_length: int=64,
+        seed: int=42,
+        batch_size: int=32,
+        num_workers: int=4,
+        model_name: str=None
+):
+    # Create a dataset
+    dataset = JSONDataset(
+            path=path,
+            corr_config=corr_config,
+            num_iters=num_iters,
+            max_sample_length=max_sample_length,
+            seed=seed,
+            model_name=model_name
+        ) 
+
+    # Create a dataloader
+    dataloader = DataLoader(
+                dataset,
+                sampler=torch.utils.data.RandomSampler(dataset, replacement=True), 
+                shuffle=False,
+                pin_memory=True,
+                batch_size=batch_size,
+                num_workers=num_workers,
+            )
+
+    return dataloader
+
 
 def get_dataloader(
         language: str = 'english', # in ['english', 'expr', 'dyck']
@@ -85,6 +121,217 @@ def get_dataloader(
 
     return dataloader
 
+
+class JSONDataset():
+    def __init__(self,
+        path: str = None,
+        seed: int = 42,
+        max_sample_length: int = 64,
+        num_iters: int = 1e6,
+        corr_config: str = None,
+        model_name: str = None
+    ):
+                # Some setup details
+        self.num_iters = int(num_iters)
+        self.max_sample_length = max_sample_length
+        self.rng = np.random.RandomState(seed)
+        self.model_name = model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.seed = seed
+
+        # Load correlation config
+        if corr_config:
+            with open(corr_config) as f:
+                self.corr_config = json.load(f)
+        else:
+            self.corr_config = {}
+
+        # Load examples from JSON.
+        self.examples = []
+        with open(path, 'r') as json_file:
+            for line in json_file:
+                self.examples.append(json.loads(line))
+
+        # Build indices for efficient sampling
+        self._build_correlation_indices()
+        print("Pregenerating sampling order...")
+        self._pregenerate_sampling_order()
+        print("Done!")
+
+    def _build_correlation_indices(self):
+        """Builds three pools of indices based on the correlation config."""
+        if not self.corr_config:
+            return
+
+        # Group examples by attribute-value pairs
+        self.attr_value_indices = defaultdict(list)
+        for idx, example in enumerate(self.examples):
+            for attr, value in example.items():
+                if attr != 'sentence':
+                    key = f"{attr}-{value}"
+                    self.attr_value_indices[key].append(idx)
+
+        # Use the first correlation rule in the config file.
+        attr1_val, target = next(iter(self.corr_config.items()))
+        attr2_val, self.correlation_prob = target # This is now the target joint probability
+
+        # Pool 1: Indices for examples with BOTH attr1_val AND attr2_val.
+        attr1_examples = set(self.attr_value_indices.get(attr1_val, []))
+        attr2_examples = set(self.attr_value_indices.get(attr2_val, []))
+        self.both_indices = list(attr1_examples & attr2_examples)
+
+        # Pool 2: Indices for examples with attr1_val but NOT attr2_val.
+        self.attr1_only_indices = list(attr1_examples - attr2_examples)
+
+        # Pool 3: Indices for all other examples (those without attr1_val).
+        all_indices = set(range(len(self.examples)))
+        other_examples = all_indices - attr1_examples
+        self.other_indices = list(other_examples)
+
+    def _pregenerate_sampling_order(self):
+        """
+        Pregenerates the sampling order based on a target joint probability.
+        """
+        if not self.corr_config or not self.both_indices:
+            # Fallback to uniform sampling if no correlation is set or if it's impossible to satisfy.
+            self.sampling_indices = self.rng.choice(len(self.examples), size=self.num_iters, replace=True)
+            if self.corr_config and not self.both_indices:
+                 print("Warning: No examples found with both specified attributes. Falling back to uniform sampling.")
+            return
+
+        # --- Define sampling probabilities for the three pools ---
+
+        # 1. The probability of sampling from the "both_indices" pool is the desired correlation.
+        p_both = self.correlation_prob
+        
+        # 2. The remaining probability is distributed between the other two pools
+        #    based on their relative sizes in the original dataset.
+        p_remaining = 1.0 - p_both
+        
+        size_attr1_only = len(self.attr1_only_indices)
+        size_other = len(self.other_indices)
+        total_remaining_size = size_attr1_only + size_other
+
+        if total_remaining_size > 0:
+            p_attr1_only = p_remaining * (size_attr1_only / total_remaining_size)
+            p_other = p_remaining * (size_other / total_remaining_size)
+        else: # Handle case where only "both_indices" has samples
+            p_attr1_only, p_other = 0.0, 0.0
+            p_both = 1.0 # Force sampling from the only available pool
+
+        # --- Determine number of samples from each pool ---
+        n_both = int(round(p_both * self.num_iters))
+        n_attr1_only = int(round(p_attr1_only * self.num_iters))
+        # The rest go to the "other" pool to ensure total is num_iters
+        n_other = self.num_iters - n_both - n_attr1_only
+        
+        # --- Generate samples from each pool ---
+        samples_both = self.rng.choice(self.both_indices, size=n_both, replace=True)
+
+        if size_attr1_only > 0:
+            samples_attr1_only = self.rng.choice(self.attr1_only_indices, size=n_attr1_only, replace=True)
+        else:
+            samples_attr1_only = np.array([], dtype=int)
+            
+        if size_other > 0:
+            samples_other = self.rng.choice(self.other_indices, size=n_other, replace=True)
+        else:
+            samples_other = np.array([], dtype=int)
+
+        # --- Combine and shuffle ---
+        self.sampling_indices = np.concatenate((samples_both, samples_attr1_only, samples_other))
+        self.rng.shuffle(self.sampling_indices)
+        
+        # Ensure the final array has the correct size after rounding
+        if len(self.sampling_indices) != self.num_iters:
+            self.sampling_indices = np.resize(self.sampling_indices, self.num_iters)
+
+    def _sample_with_correlation(self):
+        """Sample an example according to correlation constraints."""
+        if not self.correlation_pairs:
+            # No correlation constraints, sample uniformly
+            return self.rng.choice(self.examples)
+        
+        # For simplicity, focus on the first correlation pair
+        # In a more complex scenario, you might want to handle multiple pairs
+        pair_key = f"{self.correlation_pairs[0]['attr1_val']}->{self.correlation_pairs[0]['attr2_val']}"
+        corr_data = self.correlation_data[pair_key]
+        
+        correlation = corr_data['correlation']
+        both_indices = corr_data['both_indices']
+        attr1_only_indices = corr_data['attr1_only_indices']
+        
+        # If we have examples that satisfy the correlation constraint
+        if both_indices and attr1_only_indices:
+            # Sample according to correlation: p(attr2_val | attr1_val) ≈ correlation
+            if self.rng.random() < correlation:
+                # Sample from examples with both attributes
+                idx = self.rng.choice(both_indices)
+            else:
+                # Sample from examples with attr1 but not attr2
+                idx = self.rng.choice(attr1_only_indices)
+            return self.examples[idx]
+        
+        elif both_indices:
+            # Only examples with both attributes exist
+            if correlation > 0:
+                idx = self.rng.choice(both_indices)
+                return self.examples[idx]
+            else:
+                # Correlation is 0 but we only have positive examples
+                # Fall back to uniform sampling
+                return self.rng.choice(self.examples)
+        
+        elif attr1_only_indices:
+            # Only examples with attr1 but not attr2 exist
+            if correlation < 1:
+                idx = self.rng.choice(attr1_only_indices)
+                return self.examples[idx]
+            else:
+                # Correlation is 1 but we only have negative examples
+                # Fall back to uniform sampling
+                return self.rng.choice(self.examples)
+        
+        else:
+            # No examples with attr1_val, fall back to uniform sampling
+            return self.rng.choice(self.examples)
+        
+    def __len__(self):
+        """
+        Return the number of iterations made in the training loop per epoch.
+        """
+        return self.num_iters
+    
+
+    def __getitem__(self, index):
+        """
+        Get the next sequence from the example list, sampled according to correlation constraints.
+        """
+        
+        while True:
+            # Use pre-computed sampling index
+            example_idx = self.sampling_indices[index % len(self.sampling_indices)]
+            example = self.examples[example_idx]
+            
+            # Extract the sentence
+            sentence = example['sentence']
+            labels = {k: v for k, v in example.items() if k != "sentence"}
+            sequence = torch.tensor(self.tokenizer(sentence, return_tensors="pt").input_ids)[0]
+            seq_length = float(sequence.size(0))
+
+            # Truncate the sequence if it is longer than the max sequence length
+            if sequence.size(0) > self.max_sample_length - 3:
+                continue
+            # Pad the sequence to the max sequence length with <pad>
+            else:
+                pad_token_id = 0  # You'll need to define this properly
+                sequence = torch.cat((
+                    sequence, 
+                    torch.tensor([pad_token_id] * (self.max_sample_length - len(sequence)))
+                ))
+                break
+
+        return sequence, seq_length, labels
 
 
 class PCFGDataset():

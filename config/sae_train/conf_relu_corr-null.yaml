@@ -1,5 +1,5 @@
 deploy: True
-tag: uniform
+tag: 'relu_uniform'
 seed: 42
 
 device : "cuda:0"
@@ -17,7 +17,7 @@ data:
   max_sample_length: 64
 
 sae:
-  sae_type: 'jumprelu' # ['relu', 'jumprelu', 'topk', 'sparsemax_dist']
+  sae_type: 'relu' # ['relu', 'jumprelu', 'topk', 'sparsemax_dist']
   exp_factor: 8
   kval_topk: 100
   gamma_reg: 0.001 # ['default' <-- stick with this in general]

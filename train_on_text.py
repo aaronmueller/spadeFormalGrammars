@@ -1,21 +1,82 @@
-import hydra 
+import hydra
+import yaml
 import torch
 import torch.nn.functional as F
 import os
+import numpy as np
 import pickle as pkl
+import argparse
+import sys
+from box import Box
 
 from model import GPT
-from dgp import get_dataloader
+from dgp import get_dataloader, get_dataloader_json
 from sae import SAE, step_fn
 
-from utils import init_wandb, set_seed, save_config, open_log, cleanup
+from utils import set_seed, save_config, open_log, cleanup
 from utils import update_cosine_warmup_lr
 from utils import save_sae, move_to_device, log_sae_train
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-@hydra.main(config_path="./config/sae_train", config_name="conf.yaml", version_base="1.3")
+# @hydra.main(config_path="./config/sae_train", config_name="conf.yaml", version_base="1.3")
+def main_hf(sae_cfg):
+    # init_wandb(sae_cfg, project_name="pcfg_saes_training")
+    print(sae_cfg)
+    set_seed(sae_cfg.seed)
+    # save_config(sae_cfg)
+    # fp = open_log(sae_cfg)
+    device = sae_cfg.device if torch.cuda.is_available() else 'cpu'
+
+    base_model_name = sae_cfg.model_name
+    base_model = AutoModelForCausalLM.from_pretrained(base_model_name)
+    base_model_tok = AutoTokenizer.from_pretrained(base_model_name)
+
+    # Load model parameters
+    # base_model.load_state_dict(base_model_dict['net'])
+    base_model.to(device)
+    # base_model_tok.to(device)
+    # print("number of parameters: %.2fM" % (base_model.get_num_params()/1e6,))
+
+    # Define dataloader
+    dataloader = get_dataloader_json(
+        path=sae_cfg.data.path,
+        corr_config=sae_cfg.data.corr_config,
+        num_iters=sae_cfg.data.num_iters * sae_cfg.data.batch_size,
+        max_sample_length=sae_cfg.data.max_sample_length,
+        seed=sae_cfg.seed,
+        batch_size=sae_cfg.data.batch_size,
+        num_workers=sae_cfg.data.num_workers,
+        model_name=sae_cfg.model_name
+    )
+
+    # Define SAE
+    dimin = base_model.config.hidden_size
+    sae = SAE(
+        dimin=dimin,
+        width=dimin*sae_cfg.sae.exp_factor, 
+        sae_type=sae_cfg.sae.sae_type,
+        kval_topk=sae_cfg.sae.kval_topk if sae_cfg.sae.sae_type=='topk' else None,
+        normalize_decoder=(not sae_cfg.sae.sae_type == 'sparsemax_dist'),
+    )
+    sae.to(device)
+    # print("number of parameters: %.2fM" % (base_model.get_num_params()/1e6,))
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(sae.parameters(), lr=sae_cfg.optimizer.learning_rate,
+        betas=(sae_cfg.optimizer.beta1, sae_cfg.optimizer.beta2),
+        weight_decay=sae_cfg.optimizer.weight_decay)
+
+    # Train
+    train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, encoder_reg=sae_cfg.sae.encoder_reg)
+
+    # Close wandb and log file
+    # cleanup(sae_cfg, fp)
+
+
+# @hydra.main(config_path="./config/sae_train", config_name="conf.yaml", version_base="1.3")
 def main(sae_cfg):
-    init_wandb(sae_cfg, project_name="pcfg_saes_training")
+    # init_wandb(sae_cfg, project_name="pcfg_saes_training")
     set_seed(sae_cfg.seed)
     save_config(sae_cfg)
     fp = open_log(sae_cfg)
@@ -68,16 +129,17 @@ def main(sae_cfg):
     train(sae_cfg, sae, base_model, dataloader, optimizer, device, encoder_reg=sae_cfg.sae.encoder_reg)
 
     # Close wandb and log file
-    cleanup(sae_cfg, fp)
+    # cleanup(sae_cfg, fp)
 
 
-def train(sae_cfg, sae, base_model, dataloader, optimizer, device, encoder_reg=True):
+def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, encoder_reg=True):
     """
     Training function
     """
     # Set SAE to train mode and base model to eval mode
     sae.train()
     base_model.eval()
+    mid_layer = base_model.config.num_hidden_layers // 2
     
     # Hook to get activations for SAE training
     activations = []
@@ -86,11 +148,13 @@ def train(sae_cfg, sae, base_model, dataloader, optimizer, device, encoder_reg=T
         Function to define hooks for storing activations.
         """
         def hook(model, input, output):
+            if type(output) is tuple:
+                output = output[0]
             activations.append(output.detach().clone())
         return hook
 
     # Attach hook to get activations
-    act_hook = base_model.transformer.h[0].register_forward_hook(getActivation())
+    act_hook = base_model.gpt_neox.layers[mid_layer].register_forward_hook(getActivation())
 
     # Data type (bf16 for efficiency)
     dt = torch.bfloat16 if sae_cfg.bf16 else torch.float32
@@ -126,8 +190,19 @@ def train(sae_cfg, sae, base_model, dataloader, optimizer, device, encoder_reg=T
         #     break
 
         # Log train metrics
-        if it % sae_cfg.log.log_interval == 0:
-            train_log = log_sae_train(it, sae_cfg.deploy, lr, train_log)
+        if it % sae_cfg.log.log_interval == 0 and it != 0:
+            results = {
+                "total loss": np.mean(train_log['total']),
+                "MSE": np.mean(train_log['mse']),
+                "Reg.": np.mean(train_log['reg']),
+                "% Sparsity": np.mean(train_log['p_sparsity']),
+                "Lambda": np.mean(train_log['lambda']),
+                "iteration": it,
+                "lr": lr
+            }
+            print(results)
+            # train_log = log_sae_train(it, sae_cfg.deploy, lr, train_log)
+
 
         # Update LR
         it, lr = update_cosine_warmup_lr(it, sae_cfg.optimizer, optimizer, total_steps)
@@ -142,8 +217,8 @@ def train(sae_cfg, sae, base_model, dataloader, optimizer, device, encoder_reg=T
             # Get activations
             activations = [] # Reset activations
             with torch.no_grad():
-                base_model(inputs) 
-                activations = activations[0][inputs < 60] # Pull out relevant tokens
+                base_model(inputs)
+                activations = activations[0][inputs > 2] # Pull out relevant tokens
 
             # Get SAE output
             pred_activations, latent_code = sae(activations, return_hidden=True) 
@@ -218,4 +293,13 @@ def train(sae_cfg, sae, base_model, dataloader, optimizer, device, encoder_reg=T
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config-name", "-c", type=str, default="conf.yaml")
+    args = parser.parse_args()
+
+    with open(f"./config/sae_train/{args.config_name}", 'r') as handle:
+        sae_cfg = yaml.safe_load(handle)
+
+    sae_cfg = Box(sae_cfg)
+
+    main_hf(sae_cfg)

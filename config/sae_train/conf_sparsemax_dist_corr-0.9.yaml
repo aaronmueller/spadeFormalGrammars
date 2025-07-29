@@ -1,5 +1,5 @@
 deploy: True
-tag: uniform
+tag: 'sparsemax_dist_corr_0.9'
 seed: 42
 
 device : "cuda:0"
@@ -10,14 +10,14 @@ model_name: 'EleutherAI/pythia-70m-deduped'
 
 data:
   path: '../data/labeled_sentences_large_deduped_train.jsonl'
-  corr_config: null
-  batch_size: 128
+  corr_config: '../configs/corr_ds-sp_0.9.jsonl'
+  batch_size: 64
   num_workers: 2
   num_iters: 10000
   max_sample_length: 64
 
 sae:
-  sae_type: 'jumprelu' # ['relu', 'jumprelu', 'topk', 'sparsemax_dist']
+  sae_type: 'sparsemax_dist' # ['relu', 'jumprelu', 'topk', 'sparsemax_dist']
   exp_factor: 8
   kval_topk: 100
   gamma_reg: 0.001 # ['default' <-- stick with this in general]

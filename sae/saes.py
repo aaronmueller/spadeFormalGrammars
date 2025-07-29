@@ -81,9 +81,10 @@ class SAE(torch.nn.Module):
         elif self.sae_type=='topk':
             x = x-self.bd
             x = torch.matmul(x, self.Ae.T)
-            _, topk_indices = torch.topk(F.relu(x), self.kval_topk, dim=-1)
+            a = torch.topk(F.relu(x), self.kval_topk, dim=-1)
+            # _, topk_indices = torch.topk(F.relu(x), self.kval_topk, dim=-1)
             mask = torch.zeros_like(x)
-            mask.scatter_(-1, topk_indices, 1)
+            mask.scatter_(-1, a[1], 1)
             xint = x * mask* lam
             if self.normalize_decoder:
                 eps = 1e-6
@@ -139,7 +140,7 @@ class JumpReLU(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, threshold, bandwidth):
         if not isinstance(bandwidth, torch.Tensor):
-            bandwidth = torch.tensor(bandwidth, dtype=x.dtype, device=x.device)
+            bandwidth = torch.tensor(bandwidth, dtype=x.dtype, device="cuda")
         ctx.save_for_backward(x, threshold, bandwidth)
         return x*(x>threshold)
 

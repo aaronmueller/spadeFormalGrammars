@@ -1,5 +1,7 @@
-deploy: True
-tag: uniform
+import yaml
+
+template = """deploy: True
+tag: {tag}
 seed: 42
 
 device : "cuda:0"
@@ -10,14 +12,14 @@ model_name: 'EleutherAI/pythia-70m-deduped'
 
 data:
   path: '../data/labeled_sentences_large_deduped_train.jsonl'
-  corr_config: null
-  batch_size: 128
+  corr_config: {corr_config}
+  batch_size: 64
   num_workers: 2
   num_iters: 10000
   max_sample_length: 64
 
 sae:
-  sae_type: 'jumprelu' # ['relu', 'jumprelu', 'topk', 'sparsemax_dist']
+  sae_type: {sae_type} # ['relu', 'jumprelu', 'topk', 'sparsemax_dist']
   exp_factor: 8
   kval_topk: 100
   gamma_reg: 0.001 # ['default' <-- stick with this in general]
@@ -60,3 +62,18 @@ hydra:
   sweep:
     dir: .
     subdir: .
+"""
+
+for corr in ("null", 0.1, 0.2, 0.5, 0.9, 1.0):
+    # for sae_type in ("relu", "topk", "sparsemax_dist"):
+    for sae_type in ("sparsemax_dist",):
+        if corr == "null":
+            tag = f"\'{sae_type}_uniform\'"
+            corr_config = "null"
+        else:
+            tag = f"\'{sae_type}_corr_{corr}\'"
+            corr_config = f"\'../configs/corr_ds-sp_{corr}.jsonl\'"
+        config_str = template.format(tag=tag, corr_config=corr_config, sae_type=f"\'{sae_type}\'")
+        # data = yaml.safe_load(config_str)
+        with open(f"conf_{sae_type}_corr-{corr}.yaml", 'w') as handle:
+            handle.write(config_str)

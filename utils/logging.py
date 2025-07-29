@@ -79,7 +79,7 @@ def init_wandb(cfg, project_name):
     if cfg.deploy:
         wandb.init(project=project_name)
         wandb.run.name = wandb.run.id
-        wandb.run.save()
+        wandb.run.save(project_name)
         wandb.config.update(OmegaConf.to_container(cfg))
 
 
@@ -200,7 +200,7 @@ def save_sae(cfg, sae, optimizer, it):
             'iter': it,
             'config': cfg,
         }
-        fdir = 'sae_results/' + cfg.tag + "/" + wandb.run.id
+        fdir = 'sae_results/' + cfg.tag + "/"
         os.makedirs(fdir, exist_ok=True)
         if cfg.log.save_multiple:
             fname = os.path.join(fdir, 'ckpt_' + str(it+1) + '.pt')
@@ -208,4 +208,3 @@ def save_sae(cfg, sae, optimizer, it):
             fname = os.path.join(fdir, 'latest_ckpt.pt')
         torch.save(checkpoint, fname)
         return fdir
-
