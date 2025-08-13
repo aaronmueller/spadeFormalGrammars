@@ -243,17 +243,20 @@ def get_mid_layer(submodules, layer):
             return submodule
 
 
-def get_activations(model, submodule, dictionary, batch):
+def get_activations(model, submodule, dictionary, batch, args):
     with t.no_grad(), model.trace(batch):
         x = submodule.get_activation()
         x_saved = x.save()
-    x_hat, f = dictionary(x_saved.value, return_hidden=True)
+    x_saved = x_saved.value
+    if "sparsemax_dist" in args.sae:
+        x_saved = x_saved[0]
+    x_hat, f = dictionary(x_saved, return_hidden=True)
     # f_saved = f.save()
     return f.detach()
 
 
-def load_dataset():
-    return Dataset("../data/labeled_sentences.jsonl")
+def load_dataset(dataset):
+    return Dataset(dataset)
 
 
 def score_identification(acts, labels, lamda=0.1, metric="accuracy"):
@@ -393,6 +396,7 @@ def plot_distributions(activations, top_features, labels, bins=30, model_name="p
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="pythia70m")
+    parser.add_argument("--dataset", "-d", type=str, default="../data/labeled_sentences.jsonl")
     parser.add_argument("--sae", "-s", type=str, default="sae_results/relu_uniform/latest_ckpt.pt")
     parser.add_argument("--id-metric", type=str, choices=["accuracy", "macrof1", "mcc"], default="mcc")
     parser.add_argument("--lamda", type=float, default=0.1)
@@ -439,7 +443,7 @@ if __name__ == "__main__":
     # dictionary = dictionaries[submodule]
 
 
-    dataset = load_dataset()
+    dataset = load_dataset(args.dataset)
     examples = dataset.examples
     labels = dataset.labels_binary
     num_examples = len(examples)
@@ -459,7 +463,6 @@ if __name__ == "__main__":
     with t.no_grad(), model.trace("test"):
         x = submodule.get_activation()
         x_saved = x.save()
-    print(x_saved.value.shape)
     x_hat, f = dictionary(x_saved.value, return_hidden=True)
     num_hidden = f.detach().shape[-1]
     # f_saved = f.save()
@@ -467,7 +470,10 @@ if __name__ == "__main__":
     acts = t.zeros((num_examples, num_hidden))
 
     for idx, batch in tqdm(enumerate(batches), desc="Caching activations", total=len(batches)):
-        f = get_activations(model, submodule, dictionary, batch).sum(dim=1)
+        f = get_activations(model, submodule, dictionary, batch, args)
+        if "sparsemax_dist" in args.sae:
+            f = f.unsqueeze(0)
+        f = f.sum(dim=1)
         len_batch = len(batch)
         start_idx = idx * batch_size
         acts[start_idx : start_idx + len_batch] = f
@@ -485,7 +491,7 @@ if __name__ == "__main__":
             print(f"{label}: {top_scores[i]} ({top_features[label]})")
         # for i, label in enumerate(list(top_features.keys())):
         #     print(f"{label}: {top_scores[i]} ({top_features[label]})")
-        print(f"MCC: {mcc:.3f}")    
+        print(f"MCC: {mcc:.3f}") 
     else:
         print(scores)
         print(sum(list(scores.values())))
