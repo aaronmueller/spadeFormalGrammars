@@ -252,7 +252,7 @@ def get_activations(model, submodule, dictionary, batch, args):
         x_saved = x_saved[0]
     x_hat, f = dictionary(x_saved, return_hidden=True)
     # f_saved = f.save()
-    return f.detach()
+    return (f.detach(), x_hat.detach())
 
 
 def load_dataset(dataset):
@@ -342,6 +342,52 @@ def score_sensitivity(acts, labels, feature_idx, lamda=0.1, target_label="domain
             (acts[idx1][feature_idx] < lamda and acts[idx2][feature_idx] > lamda):
             sensitive += 1
     return sensitive / total, total
+
+
+def reconstruct_means(acts, labels, target_label1="domain-science", target_label2="sentiment-positive"):
+    label1_present = set(t.Tensor(labels[target_label1]).nonzero().squeeze().tolist())
+    label2_present = set(t.Tensor(labels[target_label2]).nonzero().squeeze().tolist())
+    acts1 = np.zeros_like(acts[0])
+    acts2 = np.zeros_like(acts[0])
+    acts12 = np.zeros_like(acts[0])
+    for idx1 in label1_present:     # Find all target_label1 sentences, take mean (v_1)
+        if idx1 in label2_present:
+            continue
+        acts1 = np.add(acts1, acts[idx1])
+    acts1 /= len(label1_present)
+    for idx2 in label2_present:     # Find all target_label2 sentences, take mean (v_2)
+        if idx2 in label1_present:
+            continue
+        acts2 = np.add(acts2, acts[idx2])
+    acts2 /= len(label2_present)
+
+    label12_present = label1_present.intersection(label2_present)
+    for idx12 in label12_present:   # Find all target_label1 AND target_label2 sentences, take mean (v_12)
+        acts12 = np.add(acts12, acts[idx12])
+    acts12 /= len(label12_present)
+
+    A = np.column_stack([acts1, acts2])
+    coeffs, residuals, rank, singular_values = np.linalg.lstsq(A, acts12, rcond=None)
+    
+    alpha, beta = coeffs
+    reconstruction = alpha * acts1 + beta * acts2
+    resid_vec = acts12 - reconstruction
+
+    mse = np.square(resid_vec).mean()
+    acts12_norm = np.linalg.norm(acts12)
+    relative_error = np.linalg.norm(resid_vec) / acts12_norm if acts12_norm > 0 else float('inf')
+
+    ss_tot = np.square(acts12 - acts12.mean()).sum()
+    ss_res = np.square(resid_vec).sum()
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+    return {"coefficients": (alpha, beta),
+            "reconstruction": reconstruction,
+            "residual_vector": resid_vec,
+            "MSE": mse,
+            "relative_error": relative_error,
+            "r_squared": r_squared,
+            "rank": rank}
 
 
 def plot_distributions(activations, top_features, labels, bins=30, model_name="pythia70m", lamda=0.1):
@@ -434,8 +480,8 @@ if __name__ == "__main__":
     #         device=device
     # )
     if args.randomize_sae:
-        dictionaries[submodule].encoder.reset_parameters()
-        dictionaries[submodule].decoder.reset_parameters()
+        dictionary.encoder.reset_parameters()
+        dictionary.decoder.reset_parameters()
         # dictionaries[submodule].W_enc.data.normal_(mean=0, std=0.1)
         # dictionaries[submodule].W_dec.data.normal_(mean=0, std=0.1)
         # dictionaries[submodule].b_enc.data.normal_(mean=0, std=0.1)
@@ -465,18 +511,23 @@ if __name__ == "__main__":
         x_saved = x.save()
     x_hat, f = dictionary(x_saved.value, return_hidden=True)
     num_hidden = f.detach().shape[-1]
+    num_hidden_xhat = x_hat.detach().shape[-1]
     # f_saved = f.save()
     # num_hidden = f_saved.value.detach().shape[-1]
     acts = t.zeros((num_examples, num_hidden))
+    acts_xhat = t.zeros((num_examples, num_hidden_xhat))
 
     for idx, batch in tqdm(enumerate(batches), desc="Caching activations", total=len(batches)):
-        f = get_activations(model, submodule, dictionary, batch, args)
+        f, xhat = get_activations(model, submodule, dictionary, batch, args)
         if "sparsemax_dist" in args.sae:
             f = f.unsqueeze(0)
+            xhat = xhat.unsqueeze(0)
         f = f.sum(dim=1)
+        xhat = xhat.sum(dim=1)
         len_batch = len(batch)
         start_idx = idx * batch_size
         acts[start_idx : start_idx + len_batch] = f
+        acts_xhat[start_idx : start_idx + len_batch] = xhat
 
     scores, top_features = score_identification(acts, dataset.labels_binary, 
                                                 lamda=args.lamda, metric=args.id_metric)
@@ -498,6 +549,19 @@ if __name__ == "__main__":
         print(sum(list(scores.values())) / len(list(scores.keys())))
         print()
         print(top_features)
+
+    print()
+    rec_metrics = reconstruct_means(acts, dataset.labels_binary)
+    print("Feature reconstruction:")
+    print("\tRelative error:", rec_metrics["relative_error"])
+    print("\tR^2:", rec_metrics["r_squared"])
+    print("\tCoefficients:", rec_metrics["coefficients"])
+
+    rec_metrics = reconstruct_means(acts_xhat, dataset.labels_binary)
+    print("Decoded activation reconstruction:")
+    print("\tRelative error:", rec_metrics["relative_error"])
+    print("\tR^2:", rec_metrics["r_squared"])
+    print("\tCoefficients:", rec_metrics["coefficients"])
 
     # sensitivities = {}
     # for label in tqdm(dataset.labels_binary, total=len(list(dataset.labels_binary.keys())), desc="Sensitivity of label"):
