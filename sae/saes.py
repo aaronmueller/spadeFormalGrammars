@@ -5,8 +5,8 @@ import torch.nn.functional as F
 import torch
 
 class SAE(torch.nn.Module):
-    def __init__(self, dimin=2, width=5, sae_type='relu', kval_topk=None, 
-                 normalize_decoder=False, lambda_init = None):
+    def __init__(self, dimin=2, width=5, sae_type='relu', kval_topk=None, mp_kval=None,
+                 normalize_weights=False, lambda_init = None):
         """
         dimin: (int)
             input dimension
@@ -16,24 +16,36 @@ class SAE(torch.nn.Module):
             one of 'relu', 'topk', 'jumprelu', 'sparsemax_lintx', 'sparsemax_dist'
         kval_topk: (int)
             k in topk sae_type
-        normalize_decoder: (bool)
+        normalize_weights: (bool)
             whether to normalize the decoder weights to unit norm
         """
         super(SAE, self).__init__()
         self.sae_type = sae_type
         self.width = width
         self.dimin = dimin
-        self.normalize_decoder = normalize_decoder
+        self.normalize_weights = normalize_weights
 
         ## Encoder parameters
-        self.be = nn.Parameter(torch.zeros((1, width)))
         self.Ae = nn.Parameter(torch.randn((width, dimin))) #N(0,1) init
+        if not 'MP' in sae_type:
+            self.be = nn.Parameter(torch.zeros((1, width)))
 
         ## Decoder parameters
         self.bd = nn.Parameter(torch.zeros((1, dimin)))
-        self.Ad = nn.Parameter(torch.randn((dimin, width))) #N(0,1) init
-        with torch.no_grad():
-            self.Ad.copy_(self.Ae.T) #at init, decoder is the transpose of encoder
+        if not 'MP' in sae_type:
+            self.Ad = nn.Parameter(torch.randn((dimin, width))) #N(0,1) init
+            with torch.no_grad():
+                self.Ad.copy_(self.Ae.T) #at init, decoder is the transpose of encoder
+
+        ## Normalize the encoder and decoder weights, if desired
+        if normalize_weights:
+            print('\n\n==== Normalizing encoder / decoder weights ====\n\n')
+            with torch.no_grad():
+                Ae_unit = self.Ae / (self.eps + torch.linalg.norm(self.Ae, dim=1, keepdim=True))
+                self.Ae.copy_(Ae_unit)
+                if not 'MP' in sae_type:
+                    Ad_unit = self.Ad / (self.eps + torch.linalg.norm(self.Ad, dim=0, keepdim=True))
+                    self.Ad.copy_(Ad_unit)
 
         ## Parameters for specific SAEs
         # JumpReLU
@@ -58,67 +70,103 @@ class SAE(torch.nn.Module):
             else:
                 raise ValueError('kval_topk must be provided for topk sae_type')
 
+        # MP parameter
+        if sae_type=='MP':
+            if mp_kval is not None:
+                self.mp_kval = mp_kval
+            else:
+                raise ValueError('kval_topk must be provided for topk sae_type')
+
 
     @property
     def lambda_val(self): #lambda_val is lambda, forced to be positive here
         return F.softplus(self.lambda_pre)
 
 
-    def forward(self, x, return_hidden=False):
+    def forward(self, x, return_hidden=False, inf_k=None):
         lam = self.lambda_val
 
+        ## Vanilla
         if self.sae_type=='relu':
-            x = x-self.bd #pre-encoder bias
+            # Encoder projection
+            x = x-self.bd 
             x = torch.matmul(x, self.Ae.T) + self.be
-            xint = F.relu(lam*x)
-            if self.normalize_decoder:
-                eps = 1e-6
-                Ad_unit = self.Ad / (eps+torch.linalg.norm(self.Ad, dim=0, keepdim=True))
-                x = torch.matmul(xint, Ad_unit.T) + self.bd
-            else:
-                x = torch.matmul(xint, self.Ad.T) + self.bd
 
+            # Sparse code: ReLU
+            codes = F.relu(lam*x)
+
+            # Reconstruction
+            x = torch.matmul(codes, self.Ad.T) + self.bd
+
+        ## TopK
         elif self.sae_type=='topk':
+            kval = self.kval_topk if inf_k is None else inf_k
+            
+            # Encoder projection
             x = x-self.bd
             x = torch.matmul(x, self.Ae.T)
-            a = torch.topk(F.relu(x), self.kval_topk, dim=-1)
-            # _, topk_indices = torch.topk(F.relu(x), self.kval_topk, dim=-1)
-            mask = torch.zeros_like(x)
-            mask.scatter_(-1, a[1], 1)
-            xint = x * mask* lam
-            if self.normalize_decoder:
-                eps = 1e-6
-                Ad_unit = self.Ad / (eps + torch.linalg.norm(self.Ad, dim=0, keepdim=True))
-                x = torch.matmul(xint, Ad_unit.T) + self.bd
-            else:
-                x = torch.matmul(xint, self.Ad.T) + self.bd
 
+            # Sparse code: Top-K selection
+            _, topk_indices = torch.topk(F.relu(x), kval, dim=-1)
+            mask = torch.zeros_like(x) 
+            mask.scatter_(-1, topk_indices, 1)
+
+            # Codes
+            codes = x * mask * lam
+
+            # Reconstruction
+            x = torch.matmul(codes, self.Ad.T) + self.bd
+
+        ## Matching Pursuits
+        elif self.sae_type=='MP':
+            kval = self.mp_kval if inf_k is None else inf_k
+            x = x - self.bd # Pre-encoder bias
+
+            # Initialize codes
+            codes = torch.zeros(x.shape[0], self.Ae.shape[0], device=x.device)
+
+            # Sparse code: Greedy selection of dictionary atoms
+            for _ in range(kval):
+                # Encoder projection
+                z = x @ self.Ae.T  
+                val, idx = torch.max(z, dim=1)
+
+                # Add top concept to the current codes
+                to_add = torch.nn.functional.one_hot(idx, num_classes=codes.shape[1]).float()
+                to_add = to_add * val.unsqueeze(1)
+                to_add = to_add * lam
+
+                # Accumulate contribution and update residual
+                codes = codes + to_add
+                x = x - to_add @ self.Ae
+
+            # Reconstruction
+            x = torch.matmul(codes, self.Ae) + self.bd
+
+        ## JumpReLU
         elif self.sae_type=='jumprelu':
+            # Encoder projection
             x = x-self.bd
             x = torch.matmul(x, self.Ae.T) + self.be
+
+            # Sparse code: Heavystep + ReLU function
             x = F.relu(lam*x)
             threshold = torch.exp(self.logthreshold)
-            xint = jumprelu(x, threshold, self.bandwidth)
-            x = torch.matmul(xint, self.Ad.T) + self.bd
-            if self.normalize_decoder:
-                eps = 1e-6
-                Ad_unit = self.Ad / (eps+torch.linalg.norm(self.Ad, dim=0, keepdim=True))
-                x = torch.matmul(xint, Ad_unit.T) + self.bd
-            else:
-                x = torch.matmul(xint, self.Ad.T) + self.bd
-                
-        elif self.sae_type=='sparsemax_lintx':
-            x = x-self.bd
-            x = torch.matmul(x, self.Ae.T) + self.be
-            sm = Sparsemax(dim=-1)
-            xint = sm(lam*x)
-            x = torch.matmul(xint, self.Ad.T) + self.bd
+            codes = jumprelu(x, threshold, self.bandwidth)
+
+            # Reconstruction
+            x = torch.matmul(codes, self.Ad.T) + self.bd
 
         elif self.sae_type=='sparsemax_dist':
+            # Encoder projection
             x = -lam*torch.square(torch.norm(x.unsqueeze(1)-self.Ae.unsqueeze(0), dim=-1))
+
+            # Sparse code: Sparsemax computation
             sm = Sparsemax(dim=-1)
-            xint = sm(x)
-            x = torch.matmul(xint, self.Ad.T)
+            codes = sm(x)
+
+            # Reconstruction
+            x = torch.matmul(codes, self.Ad.T)
 
         else:
             raise ValueError('Invalid sae_type')
@@ -126,7 +174,7 @@ class SAE(torch.nn.Module):
         if not return_hidden:
             return x
         else:
-            return x, xint
+            return x, codes
 
 
 

@@ -51,13 +51,16 @@ def main_hf(sae_cfg):
     )
 
     # Define SAE
+    normalize_weights = (not sae_cfg.sae.sae_type == 'sparsemax_dist' 
+                             and not 'MP' in sae_cfg.sae.sae_type)
     dimin = base_model.config.hidden_size
     sae = SAE(
         dimin=dimin,
-        width=dimin*sae_cfg.sae.exp_factor, 
+        width=int(dimin*sae_cfg.sae.exp_factor), 
         sae_type=sae_cfg.sae.sae_type,
         kval_topk=sae_cfg.sae.kval_topk if sae_cfg.sae.sae_type=='topk' else None,
-        normalize_decoder=(not sae_cfg.sae.sae_type == 'sparsemax_dist'),
+        mp_kval=sae_cfg.sae.mp_kval if sae_cfg.sae.sae_type=='MP' else None,
+        normalize_weights=normalize_weights,
     )
     sae.to(device)
     # print("number of parameters: %.2fM" % (base_model.get_num_params()/1e6,))
@@ -68,7 +71,8 @@ def main_hf(sae_cfg):
         weight_decay=sae_cfg.optimizer.weight_decay)
 
     # Train
-    train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, encoder_reg=sae_cfg.sae.encoder_reg)
+    train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, 
+          encoder_reg=sae_cfg.sae.encoder_reg, normalize_weights=normalize_weights)
 
     # Close wandb and log file
     # cleanup(sae_cfg, fp)
@@ -109,14 +113,17 @@ def main(sae_cfg):
     )
 
     # Define SAE
-    dimin = base_model_cfg.model.n_embd
+    normalize_weights = (not sae_cfg.sae.sae_type == 'sparsemax_dist' 
+                             and not 'MP' in sae_cfg.sae.sae_type)
+    dimin = base_model.config.hidden_size
     sae = SAE(
         dimin=dimin,
-        width=dimin*sae_cfg.sae.exp_factor, 
+        width=int(dimin*sae_cfg.sae.exp_factor), 
         sae_type=sae_cfg.sae.sae_type,
         kval_topk=sae_cfg.sae.kval_topk if sae_cfg.sae.sae_type=='topk' else None,
-        normalize_decoder=(not sae_cfg.sae.sae_type == 'sparsemax_dist'),
-        )
+        mp_kval=sae_cfg.sae.mp_kval if sae_cfg.sae.sae_type=='MP' else None,
+        normalize_weights=normalize_weights,
+    )
     sae.to(device)
     print("number of parameters: %.2fM" % (base_model.get_num_params()/1e6,))
 
@@ -126,13 +133,15 @@ def main(sae_cfg):
         weight_decay=sae_cfg.optimizer.weight_decay)
 
     # Train
-    train(sae_cfg, sae, base_model, dataloader, optimizer, device, encoder_reg=sae_cfg.sae.encoder_reg)
+    train(sae_cfg, sae, base_model, dataloader, optimizer, device,
+          encoder_reg=sae_cfg.sae.encoder_reg, normalize_weights=normalize_weights)
 
     # Close wandb and log file
     # cleanup(sae_cfg, fp)
 
 
-def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, encoder_reg=True):
+def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, 
+          encoder_reg=True, normalize_weights=False):
     """
     Training function
     """
@@ -155,6 +164,9 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
 
     # Attach hook to get activations
     act_hook = base_model.gpt_neox.layers[mid_layer].register_forward_hook(getActivation())
+
+    # Activation scaling
+    acts_scaling = 1 / 16.9063 # TODO: Change according to precise model / data being used
 
     # Data type (bf16 for efficiency)
     dt = torch.bfloat16 if sae_cfg.bf16 else torch.float32
@@ -219,6 +231,7 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
             with torch.no_grad():
                 base_model(inputs)
                 activations = activations[0][inputs > 2] # Pull out relevant tokens
+                activations *= acts_scaling # Scale activations to 1/D variance
 
             # Get SAE output
             pred_activations, latent_code = sae(activations, return_hidden=True) 
@@ -254,6 +267,10 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
             elif sae.sae_type == 'topk':
                 loss_reg = torch.tensor([0.0], device=device)
 
+            # MP: L0 loss
+            elif 'MP' in sae.module.sae_type:
+                loss_reg = torch.tensor([0.0], device=device)
+
             else:
                 raise ValueError('Invalid SAE type')
 
@@ -272,6 +289,18 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
             if sae_cfg.optimizer.grad_clip > 0.0: # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(sae.parameters(), sae_cfg.optimizer.grad_clip)
             optimizer.step() # Update weights
+
+            ## Normalize weights
+            if normalize_weights:
+                with torch.no_grad():
+                    # Normalize encoder weights
+                    sae.module.Ae.data /= (sae.module.eps + torch.linalg.norm(sae.module.Ae.data, dim=1, keepdim=True)) 
+                    sae.module.Ae.data *= base_model.config.hidden_size ** 0.5
+                    
+                    # Normalize decoder weights (MP doesn't have an explicit decoder)
+                    if not 'MP' in sae.module.sae_type:
+                        sae.module.Ad.data /= (sae.module.eps + torch.linalg.norm(sae.module.Ad.data, dim=0, keepdim=True))
+                        sae.module.Ad.data *= base_model.config.hidden_size ** 0.5
 
             ## Logging
             train_log['total'].append(loss.item()) # Total loss
