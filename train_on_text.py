@@ -51,8 +51,7 @@ def main_hf(sae_cfg):
     )
 
     # Define SAE
-    normalize_weights = (not sae_cfg.sae.sae_type == 'sparsemax_dist' 
-                             and not 'MP' in sae_cfg.sae.sae_type)
+    normalize_weights = True #(not sae_cfg.sae.sae_type == 'sparsemax_dist' and not 'MP' in sae_cfg.sae.sae_type)
     dimin = base_model.config.hidden_size
     sae = SAE(
         dimin=dimin,
@@ -113,8 +112,7 @@ def main(sae_cfg):
     )
 
     # Define SAE
-    normalize_weights = (not sae_cfg.sae.sae_type == 'sparsemax_dist' 
-                             and not 'MP' in sae_cfg.sae.sae_type)
+    normalize_weights = True #(not sae_cfg.sae.sae_type == 'sparsemax_dist' and not 'MP' in sae_cfg.sae.sae_type)
     dimin = base_model.config.hidden_size
     sae = SAE(
         dimin=dimin,
@@ -166,7 +164,9 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
     act_hook = base_model.gpt_neox.layers[mid_layer].register_forward_hook(getActivation())
 
     # Activation scaling
-    acts_scaling = 1 / 16.9063 # TODO: Change according to precise model / data being used
+    # TODO: Change according to precise model / data <scaling_factor> should 
+    # ensure E[||x||_2] = \sqrt{D}, where D is dimension of the representation
+    acts_scaling = 1 / 16.9063
 
     # Data type (bf16 for efficiency)
     dt = torch.bfloat16 if sae_cfg.bf16 else torch.float32
